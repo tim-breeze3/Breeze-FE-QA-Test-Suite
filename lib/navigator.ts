@@ -137,18 +137,56 @@ export async function navigateToBreeze(opts: {
             context: 'Social casino/sweepstakes site. Login button is usually in the top-right navigation.',
           });
           recordStep(loginStep);
-          await page.waitForTimeout(1200);
+
+          // Wait for login modal/form to animate in
+          log('  → waiting for login form to appear…');
+          await page.waitForTimeout(2000);
           await dismissOverlays(page, emit);
+
+          // Check if form actually appeared — if not, try clicking login again
+          const formAppearedAfterClick = await page.locator(
+            profile.loginEmailSel ?? 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="email" i]'
+          ).first().isVisible({ timeout: 3_000 }).catch(() => false);
+
+          if (!formAppearedAfterClick) {
+            log('  → login form did not appear — retrying login trigger…', 'warn');
+            // Take a screenshot to see current state
+            if (useVision) {
+              const b64 = await page.screenshot({ type: 'png' }).then(b => b.toString('base64'));
+              emit({ type: 'screenshot', testId, b64, caption: 'Login form did not appear — retrying' });
+            }
+            // Try clicking again with a broader selector
+            await smartClick({
+              page,
+              goal: 'Click the Login button to open the login modal — look specifically for a Login link in the top navigation bar',
+              selector: 'a[href*="login"], button[data-action*="login"], [class*="login"]:not(input)',
+              testId, emit, useVision,
+              stepName: 'login_trigger',
+              context: 'The login button in the top-right navigation. It may be an anchor tag with text "Login" or "Sign In". Do NOT click Register.',
+            });
+            await page.waitForTimeout(2000);
+          }
         } else {
           log('  → login form already visible', 'dim');
           recordStep({ step: 'login_trigger', method: 'direct', success: true });
         }
 
-        // Fill email
+        // Fill email — wait explicitly for the field to be visible first
+        log('  → filling email…');
+        const emailSel = profile.loginEmailSel ?? 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="email" i]';
+        try {
+          await page.waitForSelector(emailSel, { timeout: 8_000 });
+        } catch {
+          log('  ⚠ email field not found after waiting 8s', 'warn');
+          if (useVision) {
+            const b64 = await page.screenshot({ type: 'png' }).then(b => b.toString('base64'));
+            emit({ type: 'screenshot', testId, b64, caption: 'Looking for email field' });
+          }
+        }
         const emailStep = await smartFill({
           page,
           goal: 'Find the email or username input field in the login form',
-          selector: profile.loginEmailSel ?? 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="email" i]',
+          selector: emailSel,
           value: profile.siteUser,
           testId, emit, useVision,
           stepName: 'login_email',
