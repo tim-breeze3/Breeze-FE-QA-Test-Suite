@@ -1,13 +1,15 @@
 // lib/navigator.ts
 //
-// The intelligent journey navigator.
-// Drives the bot from the landing page through login → lobby → shop → Breeze iframe.
+// Intelligent journey navigator — Phases 1 + 2.
+// Drives the bot from landing page → login → lobby → shop → Breeze iframe.
 //
-// Phase 1: Uses selector hints from the site profile
-// Phase 2: Falls back to Claude vision when selectors fail
-// Records every step as a NavStep for the live UI
+// Key behaviours:
+//   - Detects already-logged-in state before attempting login
+//   - Falls back to Claude Vision when selectors fail
+//   - Dismisses overlays (cookie banners, age gates, promo modals) automatically
+//   - Records every nav step for the live UI
 
-import type { Page } from 'playwright-core';
+import type { Page, BrowserContext } from 'playwright-core';
 import type { SiteProfile, NavStep, SSEEvent } from './types';
 import { smartClick, smartFill, dismissOverlays, askVision } from './vision-navigator';
 
@@ -26,16 +28,54 @@ export const BREEZE_SEL = {
   payoutDone:  'text=/payout complete|withdrawal successful|funds sent|cash out complete/i',
 };
 
+// Login form selectors that indicate we need to log in
+const LOGIN_FORM_INDICATORS = [
+  'input[type="email"]', 'input[name="email"]',
+  'input[name="username"]', 'input[placeholder*="email" i]',
+].join(', ');
+
 export interface JourneyResult {
-  success:    boolean;
-  navSteps:   NavStep[];
-  error?:     string;
+  success:  boolean;
+  navSteps: NavStep[];
+  error?:   string;
+}
+
+type LogFn = (msg: string, level?: 'info' | 'pass' | 'fail' | 'warn' | 'dim') => void;
+
+// ── Check if already logged in ────────────────────────────────────────────────
+// Strategy: check if the Login button is ABSENT (more reliable than looking
+// for logged-in elements which vary wildly between sites).
+// Also check for definitive logged-in indicators as a secondary signal.
+async function isAlreadyLoggedIn(page: Page, profile: SiteProfile): Promise<boolean> {
+  // If a custom post-login selector is provided, use that
+  if (profile.postLoginSel) {
+    try {
+      await page.waitForSelector(profile.postLoginSel, { timeout: 3_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Check if login/register buttons are visible — if so, definitely NOT logged in
+  const loginButtonVisible = await page.locator(
+    'a:has-text("Login"), button:has-text("Login"), a:has-text("Sign In"), button:has-text("Sign In"), a:has-text("Register"), button:has-text("Register")'
+  ).first().isVisible({ timeout: 3_000 }).catch(() => false);
+
+  if (loginButtonVisible) return false;
+
+  // No login button visible — likely logged in. Double-check with a positive indicator.
+  const loggedInVisible = await page.locator(
+    '[class*="balance"], [class*="wallet"], [class*="coins"], [class*="user-menu"], [class*="avatar"], button:has-text("Deposit"), button:has-text("Buy")'
+  ).first().isVisible({ timeout: 2_000 }).catch(() => false);
+
+  return loggedInVisible;
 }
 
 // ── Main journey orchestrator ─────────────────────────────────────────────────
 export async function navigateToBreeze(opts: {
   page:    Page;
-  context: import('playwright-core').BrowserContext;
+  context: BrowserContext;
   profile: SiteProfile;
   flow:    'payin' | 'payout';
   testId:  string;
@@ -44,7 +84,8 @@ export async function navigateToBreeze(opts: {
   const { page, context, profile, flow, testId, emit } = opts;
   const navSteps: NavStep[] = [];
   const useVision = profile.useVisionFallback;
-  const log = (msg: string, level: 'info' | 'pass' | 'fail' | 'warn' | 'dim' = 'dim') =>
+
+  const log: LogFn = (msg, level = 'dim') =>
     emit({ type: 'log', testId, message: msg, level });
 
   const recordStep = (step: NavStep) => {
@@ -53,159 +94,162 @@ export async function navigateToBreeze(opts: {
   };
 
   try {
-    // ── HTTP Basic Auth (server-level) ──────────────────────────────────────
-    // Set credentials on the browser context before any navigation.
-    // This handles staging/dev sites protected by a browser-level auth prompt.
+    // ── HTTP Basic Auth ───────────────────────────────────────────────────────
     if (profile.httpUser && profile.httpPassword) {
       await context.setHTTPCredentials({
         username: profile.httpUser,
         password: profile.httpPassword,
       });
-      log(`  → HTTP Basic Auth set for ${new URL(profile.url).hostname}`, 'dim');
+      log(`  → HTTP Basic Auth set for ${new URL(profile.url).hostname}`);
     }
 
-    // ── Step 1: Land on the site ────────────────────────────────────────────
+    // ── Step 1: Navigate to site ──────────────────────────────────────────────
     log(`  → navigating to ${profile.url}`, 'info');
     await page.goto(profile.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await page.waitForTimeout(1500);
-
-    // Dismiss any overlays (cookie banners, age gates, promo modals)
-    log('  → checking for overlays…');
+    await page.waitForTimeout(2000);
     await dismissOverlays(page, emit);
 
-    // ── Step 2: Trigger login ───────────────────────────────────────────────
-    // Only if credentials are provided
+    // ── Step 2: Login (only if credentials provided) ──────────────────────────
     if (profile.siteUser && profile.sitePassword) {
-      log('  → looking for login trigger…', 'info');
 
-      const loginStep = await smartClick({
-        page,
-        goal: 'Find and click the Sign In, Login, or Register button to open the login form',
-        selector: profile.loginTriggerSel,
-        testId, emit, useVision,
-        stepName: 'login_trigger',
-        context: 'Sweepstakes/social casino site. The login button may say "Sign In", "Login", "Play Now", "Join Now", or "Register".',
-      });
-      recordStep(loginStep);
+      // First check — are we already logged in? (session cookie from previous run)
+      const alreadyIn = await isAlreadyLoggedIn(page, profile);
+      if (alreadyIn) {
+        log('  ✓ already logged in — skipping login step', 'pass');
+        recordStep({ step: 'login_trigger', method: 'selector', success: true, selector: 'already authenticated' });
 
-      if (!loginStep.success) {
-        // Maybe we're already on a login page or inline form
-        log('  → login trigger not found — checking for inline login form…', 'warn');
-      }
+      } else {
+        // Not logged in — look for login trigger button
+        log('  → looking for login button…', 'info');
 
-      // Wait for login form to appear (modal or page)
-      await page.waitForTimeout(1000);
-      await dismissOverlays(page, emit);
+        // Check if login form is already visible (some sites show inline form)
+        const formVisible = await page.locator(LOGIN_FORM_INDICATORS).first().isVisible({ timeout: 1_500 }).catch(() => false);
 
-      // Fill email
-      const emailStep = await smartFill({
-        page,
-        goal: 'Find the email or username input field in the login form',
-        selector: profile.loginEmailSel ?? 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="email" i], input[placeholder*="user" i]',
-        value: profile.siteUser,
-        testId, emit, useVision,
-        stepName: 'login_email',
-      });
-      recordStep(emailStep);
+        if (!formVisible) {
+          // Need to click something to open the login modal/page
+          const loginStep = await smartClick({
+            page,
+            goal: 'Find and click the Login or Sign In button to open the login form',
+            selector: profile.loginTriggerSel ?? 'a:has-text("Login"), button:has-text("Login"), a:has-text("Sign In"), button:has-text("Sign In")',
+            testId, emit, useVision,
+            stepName: 'login_trigger',
+            context: 'Social casino/sweepstakes site. Login button is usually in the top-right navigation.',
+          });
+          recordStep(loginStep);
+          await page.waitForTimeout(1200);
+          await dismissOverlays(page, emit);
+        } else {
+          log('  → login form already visible', 'dim');
+          recordStep({ step: 'login_trigger', method: 'direct', success: true });
+        }
 
-      // Fill password
-      const passStep = await smartFill({
-        page,
-        goal: 'Find the password input field in the login form',
-        selector: profile.loginPassSel ?? 'input[type="password"], input[name="password"]',
-        value: profile.sitePassword,
-        testId, emit, useVision,
-        stepName: 'login_password',
-      });
-      recordStep(passStep);
+        // Fill email
+        const emailStep = await smartFill({
+          page,
+          goal: 'Find the email or username input field in the login form',
+          selector: profile.loginEmailSel ?? 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="email" i]',
+          value: profile.siteUser,
+          testId, emit, useVision,
+          stepName: 'login_email',
+        });
+        recordStep(emailStep);
 
-      // Submit login
-      const submitStep = await smartClick({
-        page,
-        goal: 'Click the submit or Sign In button to complete login',
-        selector: profile.loginSubmitSel ?? 'button[type="submit"], button:has-text("Sign In"), button:has-text("Login"), button:has-text("Log In")',
-        testId, emit, useVision,
-        stepName: 'login_submit',
-        context: 'After filling in email and password, click the submit button.',
-      });
-      recordStep(submitStep);
+        // Fill password
+        const passStep = await smartFill({
+          page,
+          goal: 'Find the password input field',
+          selector: profile.loginPassSel ?? 'input[type="password"]',
+          value: profile.sitePassword,
+          testId, emit, useVision,
+          stepName: 'login_password',
+        });
+        recordStep(passStep);
 
-      // Wait for post-login state
-      log('  → waiting for post-login state…');
-      await page.waitForTimeout(2500);
-      await dismissOverlays(page, emit);
+        // Submit
+        const submitStep = await smartClick({
+          page,
+          goal: 'Click the submit or Sign In button to complete login',
+          selector: profile.loginSubmitSel ?? 'button[type="submit"], button:has-text("Sign In"), button:has-text("Login"), button:has-text("Log In")',
+          testId, emit, useVision,
+          stepName: 'login_submit',
+          context: 'Click the button that submits the login form.',
+        });
+        recordStep(submitStep);
 
-      // Verify we're logged in
-      const postLoginSel = profile.postLoginSel ?? '.user-avatar, .user-balance, [class*="balance"], [class*="coins"], nav [class*="user"], header [class*="profile"]';
-      try {
-        await page.waitForSelector(postLoginSel, { timeout: 8_000 });
-        log('  ✓ logged in successfully', 'pass');
-        recordStep({ step: 'post_login', method: 'selector', selector: postLoginSel, success: true });
-      } catch {
-        // Vision check — maybe logged in but selector doesn't match
-        if (useVision) {
+        // Wait for redirect / modal close
+        await page.waitForTimeout(3000);
+        await dismissOverlays(page, emit);
+
+        // Confirm logged in
+        const loggedIn = await isAlreadyLoggedIn(page, profile);
+        if (loggedIn) {
+          log('  ✓ login successful', 'pass');
+          recordStep({ step: 'post_login', method: 'selector', success: true });
+        } else if (useVision) {
+          // Vision check as last resort
           const b64 = await page.screenshot({ type: 'png' }).then(b => b.toString('base64'));
-        const check = await askVision({
+          emit({ type: 'screenshot', testId, b64, caption: 'Checking login state' });
+          const check = await askVision({
             screenshotB64: b64,
-            goal: 'Is the user currently logged in? Look for username, balance, avatar, or lobby state.',
-            context: 'Sweepstakes/social casino site.',
+            goal: 'Is the user logged in? Look for a balance, avatar, username, or lobby/game content.',
+            context: 'Social casino site. If a lobby or games are visible, user is logged in.',
           });
           log(`  🤖 Login check: ${check.reasoning}`, 'info');
-          recordStep({ step: 'post_login', method: 'vision', success: check.confidence !== 'low', visionReasoning: check.reasoning, screenshotB64: b64 });
-        } else {
-          log('  ⚠ could not confirm login — proceeding anyway', 'warn');
-          recordStep({ step: 'post_login', method: 'selector', selector: postLoginSel, success: false });
+          const loginOk = check.confidence !== 'low' && check.action !== 'none';
+          recordStep({ step: 'post_login', method: 'vision', success: loginOk, screenshotB64: b64, visionReasoning: check.reasoning });
+          if (!loginOk) {
+            log('  ⚠ login may have failed — proceeding anyway', 'warn');
+          }
         }
       }
     }
 
-    // ── Step 3: Navigate to purchase/payout flow ────────────────────────────
+    // ── Step 3: Find purchase or payout trigger ───────────────────────────────
     if (flow === 'payout') {
-      log('  → looking for payout/withdraw trigger…', 'info');
-      const payoutStep = await smartClick({
+      log('  → looking for withdraw/payout trigger…', 'info');
+      const step = await smartClick({
         page,
-        goal: 'Find and click the Withdraw, Cash Out, or Payout button',
+        goal: 'Find and click the Withdraw, Cash Out, or Redeem button',
         selector: profile.payoutTriggerSel,
         testId, emit, useVision,
         stepName: 'payout_trigger',
-        context: 'Looking for a button to initiate a payout or withdrawal of coins/cash.',
+        context: 'Social casino — looking for a withdrawal or cash-out button.',
       });
-      recordStep(payoutStep);
+      recordStep(step);
     } else {
-      log('  → looking for purchase/buy coins trigger…', 'info');
-      const purchaseStep = await smartClick({
+      log('  → looking for buy/purchase trigger…', 'info');
+      const step = await smartClick({
         page,
-        goal: 'Find and click the Buy Coins, Add Funds, Shop, Purchase, or Get Tokens button',
+        goal: 'Find and click a button to buy coins, add funds, or open the shop',
         selector: profile.purchaseTriggerSel,
         testId, emit, useVision,
         stepName: 'purchase_trigger',
-        context: 'Social casino/sweepstakes site. Button likely says "Buy Coins", "Get Coins", "Add Funds", "Shop", "Purchase", or similar.',
+        context: 'Social casino/sweepstakes site. Look for "Buy Coins", "Purchase Now", "Add Funds", "Get Coins", "Shop", or a banner CTA.',
       });
-      recordStep(purchaseStep);
+      recordStep(step);
     }
 
     await page.waitForTimeout(1500);
     await dismissOverlays(page, emit);
 
-    // ── Step 4: Select a package (payin only) ───────────────────────────────
+    // ── Step 4: Select a coin package (payin only) ────────────────────────────
     if (flow === 'payin') {
       log('  → selecting coin package…');
-      const packageSel = profile.packageSel ?? '.package:first-child, .bundle:first-child, .coin-package:first-child, [class*="package"]:first-child, [class*="bundle"]:first-child, [class*="offer"]:first-child';
-
-      const packageStep = await smartClick({
+      const packageSel = profile.packageSel ??
+        '[class*="package"]:first-child, [class*="bundle"]:first-child, [class*="offer"]:first-child, [class*="product"]:first-child';
+      const step = await smartClick({
         page,
-        goal: 'Select the first or cheapest coin package or credit bundle available',
+        goal: 'Select the first or cheapest coin package, bundle, or credit option shown',
         selector: packageSel,
         testId, emit, useVision,
         stepName: 'package_select',
-        context: 'Select any coin package, credit bundle, or purchase option. Choose the first or smallest one.',
+        context: 'Choose any purchasable package — the first or cheapest one is fine.',
       });
-      recordStep(packageStep);
-
+      recordStep(step);
       await page.waitForTimeout(1500);
     }
 
-    // ── Step 5: Wait for Breeze iframe ──────────────────────────────────────
+    // ── Step 5: Wait for Breeze iframe ────────────────────────────────────────
     log('  → waiting for Breeze payment iframe…', 'info');
     const breezeSel = profile.breezeReadySel ?? BREEZE_SEL.iframe;
 
@@ -214,33 +258,22 @@ export async function navigateToBreeze(opts: {
       log('  ✓ Breeze iframe ready', 'pass');
       recordStep({ step: 'breeze_ready', method: 'selector', selector: breezeSel, success: true });
       return { success: true, navSteps };
-
     } catch {
-      // Last resort — vision scan for the iframe
       if (useVision) {
-        log('  → Breeze iframe not found via selector — running vision scan…', 'warn');
+        log('  → iframe not found via selector — vision scanning…', 'warn');
         const b64 = await page.screenshot({ type: 'png' }).then(b => b.toString('base64'));
         emit({ type: 'screenshot', testId, b64, caption: 'Scanning for Breeze payment form' });
-
         const result = await askVision({
           screenshotB64: b64,
-          goal: 'Is there a credit card payment form or payment iframe visible on this page?',
-          context: 'Looking for a Breeze payment form with card number, expiry, CVV fields.',
+          goal: 'Is there a credit card payment form visible? Look for card number, expiry, CVV fields.',
+          context: 'This should be the Breeze payment iframe embedded in the page.',
         });
-
-        log(`  🤖 Vision scan: ${result.reasoning}`, 'info');
-        recordStep({ step: 'breeze_ready', method: 'vision', success: result.action !== 'none', screenshotB64: b64, visionReasoning: result.reasoning });
-
-        if (result.action !== 'none') {
-          return { success: true, navSteps };
-        }
+        log(`  🤖 Vision: ${result.reasoning}`, 'info');
+        const found = result.action !== 'none' && result.confidence !== 'low';
+        recordStep({ step: 'breeze_ready', method: 'vision', success: found, screenshotB64: b64, visionReasoning: result.reasoning });
+        if (found) return { success: true, navSteps };
       }
-
-      return {
-        success: false,
-        navSteps,
-        error: 'Could not locate Breeze payment iframe after full navigation journey',
-      };
+      return { success: false, navSteps, error: 'Could not locate Breeze payment iframe' };
     }
 
   } catch (err) {

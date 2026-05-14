@@ -33,7 +33,11 @@ export async function askVision(opts: {
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'anthropic-version': '2023-06-01',
+    },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1000,
@@ -76,8 +80,8 @@ If the goal cannot be achieved from this screen, use action: "none".`,
     }),
   });
 
-  const data = await response.json() as { content: Array<{ type: string; text: string }> };
-  const text = data.content.find(c => c.type === 'text')?.text ?? '{}';
+  const data = await response.json() as { content?: Array<{ type: string; text: string }> };
+  const text = (data.content ?? []).find((c: any) => c.type === 'text')?.text ?? '{}';
 
   try {
     return JSON.parse(text) as VisionResult;

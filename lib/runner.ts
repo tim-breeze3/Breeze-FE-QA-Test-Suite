@@ -287,13 +287,14 @@ async function stopAndUpload(opts: {
   try {
     const res = await (cdpSession as any).send('Browserless.stopRecording') as { value?: string };
 
-    // Guard: recording may be empty if test failed too fast for any frames to capture
+    // Guard: recording may be empty if test failed before any frames were captured
     if (!res?.value) {
-      emit({ type: 'log', testId, message: '  → no recording data (test was too short)', level: 'dim' });
+      emit({ type: 'log', testId, message: '  → no recording data (test ended too quickly)', level: 'dim' });
       return {};
     }
 
-    const buf = Buffer.from(res.value, 'binary');
+    // Browserless returns the video as a base64-encoded string, not binary
+    const buf = Buffer.from(res.value, 'base64');
     if (buf.length < 1024) {
       emit({ type: 'log', testId, message: '  → recording too small to upload (skipping)', level: 'dim' });
       return {};
