@@ -12,21 +12,25 @@ export interface SiteProfile {
   url:       string;
   createdAt: string;
 
-  // Auth
+  // HTTP Basic Auth (server-level browser prompt — separate from login form)
+  // Used when the site is behind staging/dev HTTP auth (e.g. staging2.site.com)
+  httpUser?:     string;
+  httpPassword?: string;
+
+  // Login form credentials (UI-level — filled into the actual login form)
   siteUser?:     string;
   sitePassword?: string;
 
   // Phase 1: Navigation hint selectors
-  // Bot tries each in order. All optional — vision fills gaps.
-  loginTriggerSel?:    string;  // "Sign In" button on landing
-  loginEmailSel?:      string;  // email field in login form
-  loginPassSel?:       string;  // password field
-  loginSubmitSel?:     string;  // login submit button
-  postLoginSel?:       string;  // selector/URL confirming logged in
-  purchaseTriggerSel?: string;  // "Buy Coins" / "Add Funds" button
-  packageSel?:         string;  // coin package to select (default: first)
-  breezeReadySel?:     string;  // confirms Breeze iframe is open
-  payoutTriggerSel?:   string;  // "Withdraw" / "Cash Out" button
+  loginTriggerSel?:    string;
+  loginEmailSel?:      string;
+  loginPassSel?:       string;
+  loginSubmitSel?:     string;
+  postLoginSel?:       string;
+  purchaseTriggerSel?: string;
+  packageSel?:         string;
+  breezeReadySel?:     string;
+  payoutTriggerSel?:   string;
 
   // Phase 2: AI assist flags
   useVisionFallback:   boolean;

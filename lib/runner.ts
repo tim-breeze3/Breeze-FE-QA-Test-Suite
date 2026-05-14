@@ -106,7 +106,7 @@ export async function runTests(
       // ── Phase 1+2: Navigate from landing page to Breeze iframe ────────────
       const flow = test.suite === 'payout' ? 'payout' : 'payin';
       const journey = await navigateToBreeze({
-        page, profile: config.profile, flow, testId: test.id, emit,
+        page, context, profile: config.profile, flow, testId: test.id, emit,
       });
 
       if (!journey.success) {
@@ -285,8 +285,20 @@ async function stopAndUpload(opts: {
   const { recording, cdpSession, runFolderId, filename, emit, testId } = opts;
   if (!recording || !cdpSession || !runFolderId) return {};
   try {
-    const res = await (cdpSession as any).send('Browserless.stopRecording') as { value: string };
+    const res = await (cdpSession as any).send('Browserless.stopRecording') as { value?: string };
+
+    // Guard: recording may be empty if test failed too fast for any frames to capture
+    if (!res?.value) {
+      emit({ type: 'log', testId, message: '  → no recording data (test was too short)', level: 'dim' });
+      return {};
+    }
+
     const buf = Buffer.from(res.value, 'binary');
+    if (buf.length < 1024) {
+      emit({ type: 'log', testId, message: '  → recording too small to upload (skipping)', level: 'dim' });
+      return {};
+    }
+
     emit({ type: 'log', testId, message: `  → uploading ${(buf.length/1024/1024).toFixed(1)}MB to Drive…`, level: 'dim' });
     const upload = await uploadRecording({ buffer: buf, filename, folderId: runFolderId });
     emit({ type: 'log', testId, message: '  → Drive upload complete ✓', level: 'pass' });

@@ -29,7 +29,9 @@ type LogEntry = { time: string; msg: string; level: string; testId?: string };
 
 // ── Blank profile ─────────────────────────────────────────────────────────────
 const BLANK_PROFILE: Omit<SiteProfile, 'id' | 'createdAt'> = {
-  name: '', url: '', siteUser: '', sitePassword: '',
+  name: '', url: '',
+  httpUser: '', httpPassword: '',
+  siteUser: '', sitePassword: '',
   loginTriggerSel: '', loginEmailSel: '', loginPassSel: '',
   loginSubmitSel: '', postLoginSel: '', purchaseTriggerSel: '',
   packageSel: '', breezeReadySel: '', payoutTriggerSel: '',
@@ -192,10 +194,30 @@ function ProfileEditor({ profile, onChange, onSave, onCancel, saving }: {
           {field('Site Name', 'name', 'text', 'Lucky Coins Casino')}
           {field('Landing Page URL', 'url', 'url', 'https://luckycasino.com')}
 
-          {/* Auth */}
-          <div style={{ margin: '16px 0 10px', fontSize: 11, color: '#4b5563', textTransform: 'uppercase', letterSpacing: 1 }}>
-            ── Login Credentials
+          {/* HTTP Basic Auth */}
+          <div style={{ margin: '16px 0 10px', fontSize: 11, color: '#f87171', textTransform: 'uppercase', letterSpacing: 1 }}>
+            ── HTTP Basic Auth (optional)
           </div>
+          <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 10 }}>
+            Server-level auth (browser popup prompt). Used for staging/dev environments.
+            Separate from the login form credentials below.
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+            <div>
+              {field('HTTP username', 'httpUser', 'text', 'staging')}
+            </div>
+            <div>
+              {field('HTTP password', 'httpPassword', 'password', '••••••••')}
+            </div>
+          </div>
+
+          {/* Login form credentials */}
+          <div style={{ margin: '16px 0 10px', fontSize: 11, color: '#4b5563', textTransform: 'uppercase', letterSpacing: 1 }}>
+            ── Login Form Credentials
+          </div>
+          <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 10 }}>
+            UI-level credentials filled into the site's actual login form.
+          </p>
           {field('Username / Email', 'siteUser', 'text', 'bot@test.com')}
           {field('Password', 'sitePassword', 'password', '••••••••')}
 
@@ -476,12 +498,15 @@ export default function Home() {
                     }}>✕</button>
                   </div>
                 </div>
-                <div style={{ marginTop: 4, display: 'flex', gap: 4 }}>
+                <div style={{ marginTop: 4, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                   {p.useVisionFallback && (
                     <span style={{ fontSize: 9, padding: '1px 5px', borderRadius: 10, background: '#1e1b4b', color: '#a78bfa' }}>AI Vision</span>
                   )}
+                  {p.httpUser && (
+                    <span style={{ fontSize: 9, padding: '1px 5px', borderRadius: 10, background: '#450a0a', color: '#f87171' }}>HTTP Auth</span>
+                  )}
                   {p.siteUser && (
-                    <span style={{ fontSize: 9, padding: '1px 5px', borderRadius: 10, background: '#1c1917', color: '#78716c' }}>Auth</span>
+                    <span style={{ fontSize: 9, padding: '1px 5px', borderRadius: 10, background: '#1c1917', color: '#78716c' }}>Login</span>
                   )}
                 </div>
               </div>

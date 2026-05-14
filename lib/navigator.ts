@@ -35,12 +35,13 @@ export interface JourneyResult {
 // ── Main journey orchestrator ─────────────────────────────────────────────────
 export async function navigateToBreeze(opts: {
   page:    Page;
+  context: import('playwright-core').BrowserContext;
   profile: SiteProfile;
   flow:    'payin' | 'payout';
   testId:  string;
   emit:    (e: SSEEvent) => void;
 }): Promise<JourneyResult> {
-  const { page, profile, flow, testId, emit } = opts;
+  const { page, context, profile, flow, testId, emit } = opts;
   const navSteps: NavStep[] = [];
   const useVision = profile.useVisionFallback;
   const log = (msg: string, level: 'info' | 'pass' | 'fail' | 'warn' | 'dim' = 'dim') =>
@@ -52,6 +53,17 @@ export async function navigateToBreeze(opts: {
   };
 
   try {
+    // ── HTTP Basic Auth (server-level) ──────────────────────────────────────
+    // Set credentials on the browser context before any navigation.
+    // This handles staging/dev sites protected by a browser-level auth prompt.
+    if (profile.httpUser && profile.httpPassword) {
+      await context.setHTTPCredentials({
+        username: profile.httpUser,
+        password: profile.httpPassword,
+      });
+      log(`  → HTTP Basic Auth set for ${new URL(profile.url).hostname}`, 'dim');
+    }
+
     // ── Step 1: Land on the site ────────────────────────────────────────────
     log(`  → navigating to ${profile.url}`, 'info');
     await page.goto(profile.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
