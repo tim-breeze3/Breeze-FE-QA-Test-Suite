@@ -234,7 +234,7 @@ async function runScenario(opts: {
   emit: (e: SSEEvent) => void;
 }): Promise<void> {
   const { test, config, page, emit } = opts;
-  const log = (msg: string, level: SSEEvent extends { type: 'log' } ? SSEEvent['level'] : never = 'dim') =>
+  const log = (msg: string, level: 'info' | 'pass' | 'fail' | 'warn' | 'dim' = 'dim') =>
     emit({ type: 'log', testId: test.id, message: msg, level });
 
   // Payout tests go to a different URL if configured
