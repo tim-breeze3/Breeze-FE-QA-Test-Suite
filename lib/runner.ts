@@ -1,22 +1,16 @@
 // lib/runner.ts
 //
-// Pure UI test runner — Scenario A (timd.app WooCommerce store).
-//
-// Flow per test:
-//   1. Add product to cart via ?add-to-cart=16 (skips product page click)
-//   2. Navigate to /checkout/
-//   3. Fill guest billing email (triggers Breeze iframe to render)
-//   4. Fill Breeze test card and submit
-//   5. Assert outcome on merchant page
-//   6. Record via Browserless → upload .webm to Google Drive
+// Test runner — uses the intelligent navigator (Phases 1+2) to reach the
+// Breeze iframe from any starting URL, then runs card/payout tests.
 
 import { chromium } from 'playwright-core';
 import { v4 as uuidv4 } from 'uuid';
 import { getOrCreateRunFolder, uploadRecording } from './drive';
+import { navigateToBreeze, BREEZE_SEL } from './navigator';
 import type { RunConfig, RunResult, TestResult, SSEEvent, TestDefinition } from './types';
 import { ALL_TESTS } from './types';
 
-// ── Sandbox test cards ────────────────────────────────────────────────────────
+// ── Test cards ────────────────────────────────────────────────────────────────
 const CARDS = {
   visaSuccessUS:  { number: '4000020000000000', cvv: '123', expiry: '12/29', zip: '10001' },
   visaDeclinedES: { number: '4539467987109256', cvv: '123', expiry: '12/29', zip: '10001' },
@@ -30,22 +24,8 @@ const CARDS = {
 
 const THREE_DS_PASSWORD = 'Checkout1!';
 
-// ── Selectors ─────────────────────────────────────────────────────────────────
-const SEL = {
-  iframe:      process.env.BREEZE_IFRAME_SELECTOR ?? 'iframe[src*="breeze"]',
-  cardNumber:  '[data-testid="card-number"], input[name="cardNumber"], input[placeholder*="card" i], input[placeholder*="1234" i]',
-  expiry:      '[data-testid="expiry"], input[name="expiry"], input[placeholder*="MM" i], input[placeholder*="expir" i]',
-  cvv:         '[data-testid="cvv"], [data-testid="cvc"], input[name="cvv"], input[name="cvc"], input[placeholder*="CVV" i]',
-  zip:         '[data-testid="zip"], input[name="zip"], input[name="postalCode"], input[placeholder*="zip" i]',
-  submit:      '[data-testid="pay-button"], [data-testid="submit"], button[type="submit"]',
-  threeds:     'iframe[src*="3ds"], iframe[src*="simulator"], iframe[src*="challenge"]',
-  threedsPass: 'input[type="password"], input[name="password"]',
-  success:     process.env.BREEZE_SUCCESS_SELECTOR    ?? 'text=/payment successful|thank you|order confirmed|order received/i',
-  failure:     process.env.BREEZE_FAILURE_SELECTOR    ?? 'text=/payment failed|declined|error/i',
-  payoutDone:  process.env.BREEZE_PAYOUT_SELECTOR     ?? 'text=/payout complete|withdrawal successful|funds sent|success/i',
-};
+type LogFn = (msg: string, level?: 'info' | 'pass' | 'fail' | 'warn' | 'dim') => void;
 
-// ── Browserless ───────────────────────────────────────────────────────────────
 function browserlessWsEndpoint(record: boolean): string {
   const token = process.env.BROWSERLESS_TOKEN;
   if (!token) throw new Error('BROWSERLESS_TOKEN is not set');
@@ -54,51 +34,14 @@ function browserlessWsEndpoint(record: boolean): string {
   return `wss://production-sfo.browserless.io?${params.join('&')}`;
 }
 
-function today(): string { return new Date().toISOString().split('T')[0]; }
-
-function timeLabel(): string {
+function today() { return new Date().toISOString().split('T')[0]; }
+function timeLabel() {
   const d = new Date();
   return `${String(d.getHours()).padStart(2,'0')}h${String(d.getMinutes()).padStart(2,'0')}m`;
 }
-
+function slugify(s: string) { return s.toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,40); }
 function getTests(suite: string): TestDefinition[] {
   return suite === 'all' ? ALL_TESTS : ALL_TESTS.filter(t => t.suite === suite);
-}
-
-type LogFn = (msg: string, level?: 'info' | 'pass' | 'fail' | 'warn' | 'dim') => void;
-
-// ── WooCommerce preflight ─────────────────────────────────────────────────────
-// Hardcoded for timd.app (Breeze Sandbox Store).
-// Uses ?add-to-cart=16 (Premium Wireless Headphones) to skip clicking product pages.
-// WooCommerce replaces the cart on each call so every test starts fresh.
-async function wooCommerceCheckoutPreflight(
-  page: import('playwright-core').Page,
-  baseUrl: string,
-  log: LogFn,
-): Promise<void> {
-  const origin = new URL(baseUrl).origin; // https://timd.app
-
-  // 1. Add product to cart instantly via query param
-  log('  → adding product to cart…');
-  await page.goto(`${origin}/?add-to-cart=16`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-
-  // 2. Go directly to checkout
-  log('  → navigating to checkout…');
-  await page.goto(`${origin}/checkout/`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
-
-  // 3. Fill guest billing email — WooCommerce requires this before showing payment
-  log('  → filling guest email…');
-  const emailSel = '#billing_email, input[name="billing_email"], input[type="email"]';
-  await page.locator(emailSel).first().waitFor({ timeout: 10_000 });
-  await page.locator(emailSel).first().fill('bot-test@breeze-sandbox.com');
-
-  // Blur triggers WooCommerce to update order totals and render the payment iframe
-  await page.locator(emailSel).first().press('Tab');
-
-  // 4. Wait for Breeze iframe to appear
-  log('  → waiting for Breeze iframe…');
-  await page.waitForSelector(SEL.iframe, { timeout: 20_000 });
-  log('  ✓ checkout ready', 'pass');
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -114,14 +57,13 @@ export async function runTests(
 
   emit({ type: 'run_start', runId, total: tests.length });
   emit({ type: 'log', message: `Run ${runId}`, level: 'info' });
-  emit({ type: 'log', message: `Store: ${config.appUrl}`, level: 'info' });
+  emit({ type: 'log', message: `Site: ${config.profile.name} (${config.profile.url})`, level: 'info' });
   emit({ type: 'log', message: `Suite: ${config.suite} · ${tests.length} tests`, level: 'dim' });
-  emit({ type: 'log', message: `Recording: ${config.videoMode}`, level: 'dim' });
+  emit({ type: 'log', message: `Vision AI: ${config.profile.useVisionFallback ? 'enabled' : 'disabled'}`, level: 'dim' });
 
   // ── Drive folder ──────────────────────────────────────────────────────────
   const shouldRecord = config.videoMode !== 'off';
   let runFolderId = '', driveFolderLink = '';
-
   if (shouldRecord) {
     try {
       emit({ type: 'log', message: 'Creating Drive folder…', level: 'dim' });
@@ -142,18 +84,6 @@ export async function runTests(
   await page.setViewportSize({ width: 1280, height: 720 });
   emit({ type: 'log', message: 'Browser connected ✓', level: 'pass' });
 
-  // ── Optional site login ───────────────────────────────────────────────────
-  if (config.siteUser && config.sitePassword) {
-    emit({ type: 'log', message: `Logging in as ${config.siteUser}…`, level: 'info' });
-    const loginUrl = process.env.LOGIN_URL ?? `${new URL(config.appUrl).origin}/login`;
-    await page.goto(loginUrl, { waitUntil: 'networkidle' });
-    await page.locator(process.env.LOGIN_USER_SELECTOR ?? 'input[type="email"]').first().fill(config.siteUser);
-    await page.locator(process.env.LOGIN_PASS_SELECTOR ?? 'input[type="password"]').fill(config.sitePassword);
-    await page.locator(process.env.LOGIN_SUBMIT_SELECTOR ?? 'button[type="submit"]').click();
-    await page.waitForURL(url => !url.toString().match(/login|signin/i), { timeout: 15_000 });
-    emit({ type: 'log', message: 'Login successful ✓', level: 'pass' });
-  }
-
   // ── Run each test ─────────────────────────────────────────────────────────
   for (const test of tests) {
     const testStart = Date.now();
@@ -165,6 +95,7 @@ export async function runTests(
     let recording = false;
 
     try {
+      // Start recording
       if (shouldRecord) {
         cdpSession = await context.newCDPSession(page);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -172,7 +103,21 @@ export async function runTests(
         recording = true;
       }
 
-      await runScenario({ test, config, page, emit });
+      // ── Phase 1+2: Navigate from landing page to Breeze iframe ────────────
+      const flow = test.suite === 'payout' ? 'payout' : 'payin';
+      const journey = await navigateToBreeze({
+        page, profile: config.profile, flow, testId: test.id, emit,
+      });
+
+      if (!journey.success) {
+        throw new Error(journey.error ?? 'Navigation failed — could not reach Breeze iframe');
+      }
+
+      // ── Run the card/payout test ───────────────────────────────────────────
+      const log: LogFn = (msg, level = 'dim') =>
+        emit({ type: 'log', testId: test.id, message: msg, level });
+
+      await runCardTest({ testId: test.id, page, log });
 
       const durationMs = Date.now() - testStart;
       emit({ type: 'log', testId: test.id, message: `  ✓ PASSED (${(durationMs/1000).toFixed(1)}s)`, level: 'pass' });
@@ -183,7 +128,11 @@ export async function runTests(
         emit, testId: test.id,
       });
 
-      results.push({ id: test.id, name: test.name, tag: test.tag, status: 'pass', durationMs, driveLink, driveFileId });
+      results.push({
+        id: test.id, name: test.name, tag: test.tag,
+        status: 'pass', durationMs, driveLink, driveFileId,
+        navSteps: journey.navSteps,
+      });
       passed++;
       emit({ type: 'test_end', result: results[results.length - 1] });
 
@@ -192,26 +141,29 @@ export async function runTests(
       const error = (err as Error).message;
       emit({ type: 'log', testId: test.id, message: `  ✕ FAILED: ${error}`, level: 'fail' });
 
+      // Always save failure recording
       const { driveLink, driveFileId } = await stopAndUpload({
         recording, cdpSession, runFolderId,
         filename: `FAILED-${test.id}-${slugify(test.name)}-${timeLabel()}.webm`,
         emit, testId: test.id,
       });
 
-      results.push({ id: test.id, name: test.name, tag: test.tag, status: 'fail', durationMs, error, driveLink, driveFileId });
+      results.push({
+        id: test.id, name: test.name, tag: test.tag,
+        status: 'fail', durationMs, error, driveLink, driveFileId,
+      });
       failed++;
       emit({ type: 'test_end', result: results[results.length - 1] });
     }
 
-    // Brief pause between tests so WooCommerce session resets cleanly
-    await page.waitForTimeout(1000);
+    // Reset between tests
+    await page.waitForTimeout(1200);
   }
 
   await browser.close();
 
   const completedAt = new Date().toISOString();
   const totalMs = Date.now() - new Date(startedAt).getTime();
-
   const summary: RunResult = {
     runId, status: 'complete', config, results,
     startedAt, completedAt, totalMs, passed, failed, driveFolderLink,
@@ -223,155 +175,124 @@ export async function runTests(
   return summary;
 }
 
-// ── Individual test scenarios ─────────────────────────────────────────────────
-async function runScenario(opts: {
-  test: TestDefinition;
-  config: RunConfig;
-  page: import('playwright-core').Page;
-  emit: (e: SSEEvent) => void;
+// ── Card/payout test scenarios ────────────────────────────────────────────────
+// By the time these run, the bot is already on the page with the Breeze iframe.
+async function runCardTest(opts: {
+  testId: string;
+  page:   import('playwright-core').Page;
+  log:    LogFn;
 }): Promise<void> {
-  const { test, config, page, emit } = opts;
-  const log: LogFn = (msg, level = 'dim') =>
-    emit({ type: 'log', testId: test.id, message: msg, level });
+  const { testId, page, log } = opts;
 
-  if (test.suite === 'payout') {
-    // Payout goes directly to the payout URL — no cart flow
-    const url = config.payoutUrl ?? config.appUrl;
-    log(`  → navigating to ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  } else {
-    // All payin + 3DS tests: add to cart → checkout → fill email → wait for iframe
-    await wooCommerceCheckoutPreflight(page, config.appUrl, log);
-  }
-
-  switch (test.id) {
-
+  switch (testId) {
     case 't1': {
       await fillBreezeCard(page, CARDS.visaSuccessUS, log);
-      await page.waitForSelector(SEL.success, { timeout: 20_000 });
-      log('  ✓ order confirmed visible', 'pass');
+      await page.waitForSelector(BREEZE_SEL.success, { timeout: 25_000 });
+      log('  ✓ success state confirmed', 'pass');
       break;
     }
-
     case 't2': {
       await fillBreezeCard(page, CARDS.visaDeclinedES, log);
-      await page.frameLocator(SEL.iframe).getByText(/payment failed|declined/i).waitFor({ timeout: 15_000 });
-      log('  ✓ decline message visible in iframe', 'pass');
+      await page.frameLocator(BREEZE_SEL.iframe).getByText(/payment failed|declined/i).waitFor({ timeout: 15_000 });
+      log('  ✓ decline confirmed in iframe', 'pass');
       break;
     }
-
     case 't3': {
       await fillBreezeCard(page, CARDS.visaDebitGB, log);
-      await page.waitForSelector(SEL.success, { timeout: 20_000 });
-      log('  ✓ order confirmed visible', 'pass');
+      await page.waitForSelector(BREEZE_SEL.success, { timeout: 25_000 });
+      log('  ✓ debit success confirmed', 'pass');
       break;
     }
-
     case 't4': {
       await fillBreezeCard(page, CARDS.visaPrepaid, log);
-      await page.frameLocator(SEL.iframe).getByText(/payment failed|declined/i).waitFor({ timeout: 15_000 });
-      log('  ✓ decline message visible in iframe', 'pass');
+      await page.frameLocator(BREEZE_SEL.iframe).getByText(/payment failed|declined/i).waitFor({ timeout: 15_000 });
+      log('  ✓ prepaid decline confirmed', 'pass');
       break;
     }
-
     case 't5': {
       await fillBreezeCard(page, CARDS.mc3dsUS, log);
       await complete3DS(page, log);
-      await page.waitForSelector(SEL.success, { timeout: 30_000 });
-      log('  ✓ order confirmed after Mastercard 3DS', 'pass');
+      await page.waitForSelector(BREEZE_SEL.success, { timeout: 30_000 });
+      log('  ✓ Mastercard 3DS success', 'pass');
       break;
     }
-
     case 't6': {
       await fillBreezeCard(page, CARDS.amex3dsUS, log);
       await complete3DS(page, log);
-      await page.waitForSelector(SEL.success, { timeout: 30_000 });
-      log('  ✓ order confirmed after Amex 3DS', 'pass');
+      await page.waitForSelector(BREEZE_SEL.success, { timeout: 30_000 });
+      log('  ✓ Amex 3DS success', 'pass');
       break;
     }
-
     case 't7': {
       await fillBreezeCard(page, CARDS.mcFR3ds, log);
       await complete3DS(page, log);
-      await page.waitForSelector(SEL.success, { timeout: 30_000 });
-      log('  ✓ order confirmed after Mastercard FR 3DS', 'pass');
+      await page.waitForSelector(BREEZE_SEL.success, { timeout: 30_000 });
+      log('  ✓ Mastercard FR 3DS success', 'pass');
       break;
     }
-
     case 't8': {
       log(`  → filling payout card ${CARDS.payoutVisa.number}`);
-      const frame = page.frameLocator(SEL.iframe);
-      await frame.locator(SEL.cardNumber).waitFor({ timeout: 20_000 });
-      await frame.locator(SEL.cardNumber).fill(CARDS.payoutVisa.number);
-      const expiryField = frame.locator(SEL.expiry);
+      const frame = page.frameLocator(BREEZE_SEL.iframe);
+      await frame.locator(BREEZE_SEL.cardNumber).waitFor({ timeout: 20_000 });
+      await frame.locator(BREEZE_SEL.cardNumber).fill(CARDS.payoutVisa.number);
+      const expiryField = frame.locator(BREEZE_SEL.expiry);
       if (await expiryField.count() > 0) await expiryField.first().fill('12/29');
-      await frame.locator(SEL.submit).click();
-      await page.waitForSelector(SEL.payoutDone, { timeout: 30_000 });
-      log('  ✓ payout completion state visible', 'pass');
+      await frame.locator(BREEZE_SEL.submit).click();
+      await page.waitForSelector(BREEZE_SEL.payoutDone, { timeout: 30_000 });
+      log('  ✓ payout complete', 'pass');
       break;
     }
-
     default:
-      throw new Error(`Unknown test ID: ${test.id}`);
+      throw new Error(`Unknown test ID: ${testId}`);
   }
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
-
 async function fillBreezeCard(
   page: import('playwright-core').Page,
   card: { number: string; cvv: string; expiry: string; zip: string },
   log: LogFn,
 ): Promise<void> {
-  const frame = page.frameLocator(SEL.iframe);
-  await frame.locator(SEL.cardNumber).waitFor({ timeout: 20_000 });
+  const frame = page.frameLocator(BREEZE_SEL.iframe);
+  await frame.locator(BREEZE_SEL.cardNumber).waitFor({ timeout: 20_000 });
   log(`  → filling card ${card.number}`);
-  await frame.locator(SEL.cardNumber).fill(card.number);
-  await frame.locator(SEL.expiry).fill(card.expiry);
-  await frame.locator(SEL.cvv).fill(card.cvv);
-  const zipField = frame.locator(SEL.zip);
-  if (await zipField.count() > 0) await zipField.first().fill(card.zip);
-  log('  → submitting…');
-  await frame.locator(SEL.submit).click();
+  await frame.locator(BREEZE_SEL.cardNumber).fill(card.number);
+  await frame.locator(BREEZE_SEL.expiry).fill(card.expiry);
+  await frame.locator(BREEZE_SEL.cvv).fill(card.cvv);
+  const zip = frame.locator(BREEZE_SEL.zip);
+  if (await zip.count() > 0) await zip.first().fill(card.zip);
+  log('  → submitting payment…');
+  await frame.locator(BREEZE_SEL.submit).click();
 }
 
-async function complete3DS(
-  page: import('playwright-core').Page,
-  log: LogFn,
-): Promise<void> {
+async function complete3DS(page: import('playwright-core').Page, log: LogFn): Promise<void> {
   log('  → waiting for 3DS simulator…');
-  const threeDsFrame = page.frameLocator(SEL.threeds);
-  await threeDsFrame.locator(SEL.threedsPass).waitFor({ timeout: 20_000 });
-  await threeDsFrame.locator(SEL.threedsPass).fill(THREE_DS_PASSWORD);
-  await threeDsFrame.locator('button[type="submit"]').click();
-  log(`  → 3DS password entered (${THREE_DS_PASSWORD})`);
+  const f = page.frameLocator(BREEZE_SEL.threeds);
+  await f.locator(BREEZE_SEL.threedsPass).waitFor({ timeout: 20_000 });
+  await f.locator(BREEZE_SEL.threedsPass).fill(THREE_DS_PASSWORD);
+  await f.locator('button[type="submit"]').click();
+  log(`  → 3DS entered (${THREE_DS_PASSWORD})`);
 }
 
 async function stopAndUpload(opts: {
-  recording: boolean;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  cdpSession: any;
-  runFolderId: string;
-  filename: string;
-  emit: (e: SSEEvent) => void;
-  testId: string;
+  recording:    boolean;
+  cdpSession:   any;
+  runFolderId:  string;
+  filename:     string;
+  emit:         (e: SSEEvent) => void;
+  testId:       string;
 }): Promise<{ driveLink?: string; driveFileId?: string }> {
   const { recording, cdpSession, runFolderId, filename, emit, testId } = opts;
   if (!recording || !cdpSession || !runFolderId) return {};
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const response = await (cdpSession as any).send('Browserless.stopRecording') as { value: string };
-    const videoBuffer = Buffer.from(response.value, 'binary');
-    emit({ type: 'log', testId, message: `  → uploading ${(videoBuffer.length/1024/1024).toFixed(1)} MB to Drive…`, level: 'dim' });
-    const upload = await uploadRecording({ buffer: videoBuffer, filename, folderId: runFolderId });
-    emit({ type: 'log', testId, message: `  → Drive upload complete ✓`, level: 'pass' });
+    const res = await (cdpSession as any).send('Browserless.stopRecording') as { value: string };
+    const buf = Buffer.from(res.value, 'binary');
+    emit({ type: 'log', testId, message: `  → uploading ${(buf.length/1024/1024).toFixed(1)}MB to Drive…`, level: 'dim' });
+    const upload = await uploadRecording({ buffer: buf, filename, folderId: runFolderId });
+    emit({ type: 'log', testId, message: '  → Drive upload complete ✓', level: 'pass' });
     return { driveLink: upload.webViewLink, driveFileId: upload.fileId };
   } catch (e) {
     emit({ type: 'log', testId, message: `  ⚠ Drive upload failed: ${(e as Error).message}`, level: 'warn' });
     return {};
   }
-}
-
-function slugify(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
 }
