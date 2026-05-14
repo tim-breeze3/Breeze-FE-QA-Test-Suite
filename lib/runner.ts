@@ -151,14 +151,16 @@ export async function runTests(
     emit({ type: 'test_start', testId: test.id, name: test.name });
     emit({ type: 'log', testId: test.id, message: `▶ ${test.name}`, level: 'info' });
 
-    let cdpSession: Awaited<ReturnType<typeof context.newCDPSession>> | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let cdpSession: any = null;
     let recording = false;
 
     try {
       // Start per-test recording
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (shouldRecord) {
         cdpSession = await context.newCDPSession(page);
-        await cdpSession.send('Browserless.startRecording');
+        await (cdpSession as any).send('Browserless.startRecording');
         recording = true;
       }
 
@@ -372,7 +374,8 @@ async function complete3DS(
 
 async function stopAndUpload(opts: {
   recording: boolean;
-  cdpSession: Awaited<ReturnType<import('playwright-core').BrowserContext['newCDPSession']>> | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  cdpSession: any;
   runFolderId: string;
   page: import('playwright-core').Page;
   filename: string;
@@ -383,7 +386,8 @@ async function stopAndUpload(opts: {
   if (!recording || !cdpSession || !runFolderId) return {};
 
   try {
-    const response = await cdpSession.send('Browserless.stopRecording') as { value: string };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response = await (cdpSession as any).send('Browserless.stopRecording') as { value: string };
     const videoBuffer = Buffer.from(response.value, 'binary');
     const mb = (videoBuffer.length / 1024 / 1024).toFixed(1);
     emit({ type: 'log', testId, message: `  → uploading ${mb} MB to Drive…`, level: 'dim' });
