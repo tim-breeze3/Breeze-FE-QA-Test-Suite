@@ -38,6 +38,7 @@ export interface JourneyResult {
   success:  boolean;
   navSteps: NavStep[];
   error?:   string;
+  page?:    Page;   // the active page after navigation (may differ from input if new tab opened)
 }
 
 type LogFn = (msg: string, level?: 'info' | 'pass' | 'fail' | 'warn' | 'dim') => void;
@@ -250,18 +251,33 @@ export async function navigateToBreeze(opts: {
     }
 
     // ── Step 5: Wait for Breeze iframe ────────────────────────────────────────
+    // Give the page a moment to settle after package click — some sites
+    // open payment in a modal, others navigate or open a new tab.
+    await page.waitForTimeout(2500);
+    await dismissOverlays(page, emit);
+
     log('  → waiting for Breeze payment iframe…', 'info');
     const breezeSel = profile.breezeReadySel ?? BREEZE_SEL.iframe;
 
+    // Check if payment opened in a new tab
+    const allPages = context.pages();
+    let targetPage = page;
+    if (allPages.length > 1) {
+      targetPage = allPages[allPages.length - 1];
+      log(`  → new tab detected — switching to it`, 'info');
+      await targetPage.waitForLoadState('domcontentloaded', { timeout: 15_000 }).catch(() => {});
+      recordStep({ step: 'new_tab', method: 'direct', success: true });
+    }
+
     try {
-      await page.waitForSelector(breezeSel, { timeout: 15_000 });
+      await targetPage.waitForSelector(breezeSel, { timeout: 15_000 });
       log('  ✓ Breeze iframe ready', 'pass');
       recordStep({ step: 'breeze_ready', method: 'selector', selector: breezeSel, success: true });
-      return { success: true, navSteps };
+      return { success: true, navSteps, page: targetPage };
     } catch {
       if (useVision) {
         log('  → iframe not found via selector — vision scanning…', 'warn');
-        const b64 = await page.screenshot({ type: 'png' }).then(b => b.toString('base64'));
+        const b64 = await targetPage.screenshot({ type: 'png' }).then(b => b.toString('base64'));
         emit({ type: 'screenshot', testId, b64, caption: 'Scanning for Breeze payment form' });
         const result = await askVision({
           screenshotB64: b64,
@@ -271,9 +287,9 @@ export async function navigateToBreeze(opts: {
         log(`  🤖 Vision: ${result.reasoning}`, 'info');
         const found = result.action !== 'none' && result.confidence !== 'low';
         recordStep({ step: 'breeze_ready', method: 'vision', success: found, screenshotB64: b64, visionReasoning: result.reasoning });
-        if (found) return { success: true, navSteps };
+        if (found) return { success: true, navSteps, page: targetPage };
       }
-      return { success: false, navSteps, error: 'Could not locate Breeze payment iframe' };
+      return { success: false, navSteps, error: 'Could not locate Breeze payment iframe', page: targetPage };
     }
 
   } catch (err) {

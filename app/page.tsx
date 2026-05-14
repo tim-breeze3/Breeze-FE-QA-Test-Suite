@@ -22,7 +22,7 @@ const NAV_STEP_LABELS: Record<string, string> = {
   login_email: '📧 Email field', login_password: '🔒 Password field',
   login_submit: '▶ Submit login', purchase_trigger: '🛒 Buy Coins',
   package_select: '📦 Select package', breeze_ready: '💳 Breeze iframe',
-  payout_trigger: '💸 Payout trigger',
+  payout_trigger: '💸 Payout trigger', new_tab: '🗂 New tab',
 };
 
 type LogEntry = { time: string; msg: string; level: string; testId?: string };

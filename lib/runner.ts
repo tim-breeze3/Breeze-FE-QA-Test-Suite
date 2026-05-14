@@ -113,11 +113,14 @@ export async function runTests(
         throw new Error(journey.error ?? 'Navigation failed — could not reach Breeze iframe');
       }
 
+      // Use the page returned by navigator — may be a new tab
+      const activePage = journey.page ?? page;
+
       // ── Run the card/payout test ───────────────────────────────────────────
       const log: LogFn = (msg, level = 'dim') =>
         emit({ type: 'log', testId: test.id, message: msg, level });
 
-      await runCardTest({ testId: test.id, page, log });
+      await runCardTest({ testId: test.id, page: activePage, log });
 
       const durationMs = Date.now() - testStart;
       emit({ type: 'log', testId: test.id, message: `  ✓ PASSED (${(durationMs/1000).toFixed(1)}s)`, level: 'pass' });
